@@ -130,6 +130,9 @@ Postgres needs a file named pwfile in its top level folder with content postgres
 4. Run the `run_all.sh` script.
 
 ## VoltDB
+1. Clone the code from [here](https://github.com/VoltDB/voltdb)
+2. Run the script in server mode in a terminal from [here](https://github.com/VoltDB/voltdb/blob/master/tests/test_apps/tpcc/run.sh)
+3. Having the server open run as many clients as you need using the script in client mode from [here](https://github.com/VoltDB/voltdb/blob/master/tests/test_apps/tpcc/run.sh)
 
 
 ## YCSB
