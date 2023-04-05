@@ -1,0 +1,4 @@
+recordcount=100000000
+operationcount=10000000
+measurementtype=timeseries
+timeseries.granularity=2000

@@ -1,0 +1,591 @@
+# Copyright 2016 - 2021 Intel Corporation
+#
+# This software and the related documents are Intel copyrighted materials, and your use of them is governed by the
+# express license under which they were provided to you (License). Unless the License provides otherwise, you may not
+# use, modify, copy, publish, distribute, disclose or transmit this software or the related documents without Intel's
+# prior written permission.
+#
+# This software and the related documents are provided as is, with no express or implied warranties, other than those
+# that are expressly stated in the License.
+#
+# vpp-collect-start
+#
+# Start collecting data for the Platform Profiler tool. Collection will
+# continue until you run the vpp-collect-stop script.
+#
+
+if [[ -z $COLLECTOR_SCRIPTS_DIR ]]; then
+     export COLLECTOR_SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ fi
+
+source "$COLLECTOR_SCRIPTS_DIR"/common.sh || exit 1
+source "$COLLECTOR_SCRIPTS_DIR"/../vpp-collect-vars.sh > /dev/null || exit 1
+
+function usage {
+    echo ""
+    echo "Usage: vpp-collect start [-c -d -t --skip --help]"
+    echo ""
+    echo "Starts a data collection session. To stop an active data collection session, "
+    echo "run $VPP_COLLECT_DIR/vpp-collect stop."
+    echo ""
+    echo "Optional parameters: "
+    echo -e "  -c \"comment text\": \t    A free text description of the data collection session"
+    echo -e "  -d <path to results dir>: Directory that stores data collection results"
+    echo -e "  -t <preset>: \t\t    Specify preset type. To see options, run \"emon -preset-list\""
+    echo -e "  --skip: \t\t    Skip benchmark collection"
+    echo -e "  --help: \t\t    Display this help message and exit"
+    echo ""
+
+}
+
+
+# sets TMP_DIR, PGX_DIR, USR_DIR, FULL_TMP_DIR
+function create_temp_directory {
+    TMP_DIR=$(get_temp_dir)
+    FULL_TMP_DIR=$(get_and_make_full_temp_dir)
+}
+
+
+# Sets result_location, comment, skip_benchmark, preset
+function parse_command_options {
+    result_location=""
+    comment=""
+    skip_benchmark=0
+    OPTIND=1
+    preset="pgx"
+    while getopts "c:d:t:-:" opt; do
+        case "$opt" in
+        # Save off the comment, since we may not have a result location yet
+        c) comment=$OPTARG
+           ;;
+        # Save off the result location using the command readlink if it exists
+        # otherwise build the absolute path with pwd
+        d) if [[ -z $( which readlink ) ]]; then
+               if [[ $OPTARG == /* ]] || [[ $OPTARG == ~* ]]; then
+                   result_location="${OPTARG}/"
+               else
+                   result_location="`pwd -P`/${OPTARG}/"
+               fi
+           else
+               result_location=`readlink -f "$OPTARG/"`
+               result_location="${result_location}/"
+           fi
+           ;;
+
+        # Save the user requested preset
+        t) preset=$OPTARG
+           ;;
+
+        -)
+            case ${OPTARG} in
+                skip) skip_benchmark=1 ;;
+                help) usage
+                      exit ;;
+                h) usage
+                   exit;;
+                *) usage
+                   exit;;
+            esac
+            ;;
+        *) usage
+           exit
+           ;;
+        esac
+    done
+
+    bad_param=${@:$OPTIND:1}
+    if [[ -n $bad_param ]]; then
+        usage
+        exit
+    fi
+}
+
+
+function ensure_location_is_writable {
+    local location="$1"
+    if ! [[ -w $location ]]; then
+        echo "Error: Unable to write to result directory: $location. Collection aborted."
+        exit 1
+    fi
+}
+
+# Depends on FULL_TMP_DIR, result_location
+# Modifies result_location
+function prepare_result_location {
+    local BASE_RESULT_DIR
+    local RES_SUFFIX
+
+    # Append the result_location to a created directory with unique name, or if result_location is
+    # blank, under current dir
+    if [[ -z $result_location ]]; then
+        BASE_RESULT_DIR="$PWD/"
+    else
+        BASE_RESULT_DIR="$result_location"
+    fi
+    result_location="${BASE_RESULT_DIR}$( hostname -s)_$( date +%Y%m%d-%H%M )"
+    RES_SUFFIX=0
+    while [[ -d $result_location ]] ; do
+        RES_SUFFIX=`expr ${RES_SUFFIX} + 1`
+        result_location="${BASE_RESULT_DIR}$( hostname -s)_$( date +%Y%m%d-%H%M )_${RES_SUFFIX}"
+    done
+
+    ensure_location_is_writable "$BASE_RESULT_DIR"
+}
+
+# Depends on $FULL_TMP_DIR
+function create_result_location {
+    local RESULT_LOCATION_FILE
+    RESULT_LOCATION_FILE="$FULL_TMP_DIR/.result_location"
+
+    #remove any existing .result_location file
+    if [[ -e $RESULT_LOCATION_FILE ]]; then
+        rm $RESULT_LOCATION_FILE
+    fi
+
+    if ! mkdir -p "$result_location"; then
+        echo "Error: Unable to create $result_location. Collection aborted."
+        exit 1
+    fi
+    echo "$result_location" > "$RESULT_LOCATION_FILE"
+
+
+    local BASENAME=.$( hostname -s )
+    DSTAT_CSV="_dstat.csv"
+    COMMENT_FILE="_comment"
+    DEST="$result_location/$BASENAME$DSTAT_CSV"
+    COMMENT_DEST="$result_location/$BASENAME$COMMENT_FILE"
+
+    if [[ -n $comment ]]; then
+        echo "$comment" > "$COMMENT_DEST"
+    fi
+}
+
+
+# Depends on $FULL_TMP_DIR
+function set_globals {
+    local BASENAME=.$( hostname -s )
+    DSTAT_TMP="_tmp_storage"
+    EMON_TMP="_tmp_emon"
+    NVDIMM_TMP="_tmp_nvdimm.csv"
+    DSTAT_TMP_DEST="$FULL_TMP_DIR/$BASENAME$DSTAT_TMP"
+    EMON_TMP_DEST="$FULL_TMP_DIR/$BASENAME$EMON_TMP"
+    NVDIMM_TMP_DEST="$FULL_TMP_DIR/$BASENAME$NVDIMM_TMP"
+    DSTAT_QUEUE=''
+    DSTAT_TIME=''
+}
+
+# if the given device name is a block device, add it to LIST_OF_DISKS
+# Modifies LIST_OF_DISKS
+function blockdevices {
+    declare -a BLOCK_DEVICES=($(ls /sys/block))
+    for DEVICE_NAME in ${BLOCK_DEVICES[@]} ; do
+        if [[ $DEVICE_NAME == "$1" ]]; then
+            if [[ -z $LIST_OF_DISKS ]]; then
+                LIST_OF_DISKS="$DEVICE_NAME"
+            else
+                LIST_OF_DISKS="$DEVICE_NAME,$LIST_OF_DISKS"
+            fi
+        fi
+    done
+}
+
+function ensure_no_collection_is_running {
+    DSTAT_PID=$( find_pid dstat $DSTAT_TMP_DEST )
+    EMON_PID=$( find_pid emon $EMON_TMP_DEST )
+
+    if [[ -n $DSTAT_PID || -n $EMON_PID ]]; then
+        echo ""
+        echo "Platform Profiler detected another collection running. Only one collection can run at a time. To stop the active collection, run $VPP_COLLECT_DIR/vpp-collect stop."
+        exit 1
+    fi
+}
+
+# Fetch information about the network interface. This is truely
+# ugly. The file is showing as readable, but attempting to read it
+# gives an invalid argument error. So attempt to read it into a
+# temporary variable, then see if we got anything. Bletch!
+#
+# NET_SPEED and NET_DUPLEX and NET_DEVICES are arrays, since we are
+# keeping track of separate network devices.
+# NET_DEVICES_CSV is a csv in the same order as NET_SPEED, NET_DUPLEX
+# and NET_DEVICES and is used as an argument to dstat
+#
+#
+# Modifies NET_DEVICES_CSV, RDMA_DEVICES, NET_DEVICES, NET_SPEED, NET_DUPLEX, DSTAT_RDMA
+function gather_network_device_info {
+    NET_DEVICES_CSV=""
+    DSTAT_RDMA=''
+    index=0
+    declare -a RDMA_DEVICES
+    x=0
+    for DEV in $( ls /sys/class/net ); do
+        # Don't record the "lo" network interface
+        if [[ $DEV != "lo" ]]; then
+            NET_DEVICES_CSV="$NET_DEVICES_CSV$DEV,"
+            NET_DEVICES[$index]=$DEV
+            TMP=""
+            TMP=$( cat /sys/class/net/$DEV/speed 2> /dev/null )
+            # -1 indicates an unknown network speed. Ignore it.
+            if [[ $TMP == "-1" ]]; then
+                TMP=""
+            fi
+
+            # Some distros report the network speed as an unsigned 32-bit integer, so 4294967295 is -1, which indicates an unknown network speed. Ignore it also.
+            if [[ $TMP == "4294967295" ]]; then
+                TMP=""
+            fi
+
+            # Some distros report the network speed as an unsigned 16-bit value (65535). Ignore it.
+            if [[ $TMP == "65535" ]]; then
+                TMP=""
+            fi
+
+            if [[ -n $TMP ]]; then
+                NET_SPEED[$index]=$TMP
+            else
+                NET_SPEED[$index]="0"
+            fi
+
+            TMP=""
+            TMP=$( cat /sys/class/net/$DEV/duplex 2> /dev/null )
+            if [[ -n $TMP ]]; then
+                NET_DUPLEX[$index]=$TMP
+            else
+                NET_DUPLEX[$index]="none"
+            fi
+
+
+            # Include RDMA plugin in dstat if RDMA devices exist
+            if [[ -d /sys/class/net/$DEV/device/infiniband ]]; then
+                if ! pcp_dstat_is_available; then
+                    DSTAT_RDMA='--net-rdma'
+                fi
+                for i in "$(ls /sys/class/net/$DEV/device/infiniband)"; do
+                    RDMA_DEVICES[${#RDMA_DEVICES[@]}+1]=$DEV/$i
+                done
+            fi
+
+            let "index++"
+        fi
+    done
+    NET_DEVICES_CSV="${NET_DEVICES_CSV}total"
+}
+
+
+function gather_cpu_info {
+    CPU_CORES=$( grep -c processor /proc/cpuinfo )
+    CPU_SOCKETS=$( grep "physical id" /proc/cpuinfo | sort -n | uniq | wc --lines )
+    CPU_CORES_PER_SOCKET=$( grep "cpu cores" /proc/cpuinfo | uniq | awk '{print $NF}' )
+    if [[ -z $CPU_CORES_PER_SOCKET ]]; then
+        CPU_CORES_PER_SOCKET=1
+    fi
+    CPU_MODEL=$( grep "model name" /proc/cpuinfo | uniq | cut -f 2 | cut -d \  -f 2- )
+    CPU_THREADS_PER_CORE=$(( $CPU_CORES / ($CPU_SOCKETS * $CPU_CORES_PER_SOCKET) ))
+}
+
+
+function gather_memory_info {
+    MEMORY_SIZE_IN_KB=$( grep "MemTotal" /proc/meminfo | cut -d \  -f 2- | rev | cut -d \  -f 2- | rev | tr -d '[[:space:]]' )
+    SWAP_SIZE_IN_KB=$( grep "SwapTotal" /proc/meminfo | cut -d \  -f 2- | rev | cut -d \  -f 2- | rev | tr -d '[[:space:]]' )
+}
+
+function gather_disk_info {
+    # Get the list of disks from lsblk
+    # Note: If the way we gather disk information changes, we may also need to adjust some logic
+    # inside the disk_info.py script because both the logic below and the logic inside disk_info.py
+    # contribute information that's used to render the VPP server's topology diagram.
+    #DISK_NAMES_STRING=$( lsblk --nodeps --list --output NAME,TYPE| grep "disk" | awk '{printf ("%s, ", $1)}' )
+    DISK_NAMES_STRING="sda, sdb, "
+    IFS=', ' read -r -a DISK_NAMES_ARRAY <<< "$DISK_NAMES_STRING"
+    for NAME in "${DISK_NAMES_ARRAY[@]}" ; do
+        blockdevices $NAME
+    done
+
+    # Disk information - we're just interested in the physical disks
+    SYSTEM_DISKS={}
+    DISK_NAME={}
+    DISK_ROTATION={}
+    DISK_INDEX=0
+    while read MAJOR MINOR BLOCKS DEVICE; do
+        if [[ ${LIST_OF_DISKS/$DEVICE} != "$LIST_OF_DISKS" ]]; then
+            MODEL_PATH="/sys/block/$DEVICE/device/model"
+            if [[ -r $MODEL_PATH ]]; then
+                NAME=$( cat $MODEL_PATH )
+            else
+                NAME="unknown model"
+            fi
+
+            # Save the information for future usage.. We haven't used them yet.
+            SYSTEM_DISKS[$DISK_INDEX]=$DEVICE
+            DISK_NAME[$DISK_INDEX]=$NAME
+            DISK_ROTATION[$DISK_INDEX]=$( cat /sys/block/$DEVICE/queue/rotational )
+
+            # So far we wrap all the disk information in this part.
+            if [[ ${DISK_ROTATION[$DISK_INDEX]} -eq 1 ]]; then
+                if [[ -z $LIST_OF_HDD ]]; then
+                    LIST_OF_HDD="$DEVICE($NAME)"
+                else
+                    LIST_OF_HDD="$DEVICE($NAME), $LIST_OF_HDD"
+                fi
+            elif [[ ${DISK_ROTATION[$DISK_INDEX]} -eq 0 ]]; then
+                device_root=/sys/block/$DEVICE
+                if [[ -e $device_root/device ]]; then
+                    device_uevent=$device_root/device/uevent
+                else
+                    device_uevent=$device_root/uevent
+                fi
+                DISK_PCI_MODEL=$( grep PCI_ID $device_uevent | cut -f2 -d"=" )
+                DISK_PCI_SLOT=$( grep PCI_SLOT_NAME $device_uevent | cut -f2 -d"=" )
+                if [[ -z $DISK_PCI_MODEL ]]; then
+                    PRINT_NAME="$NAME"
+                else
+                    PRINT_NAME="$NAME,$DISK_PCI_MODEL,$DISK_PCI_SLOT"
+                fi
+                if [[ -z $LIST_OF_SSD ]]; then
+                    LIST_OF_SSD="$DEVICE($PRINT_NAME)"
+                else
+                    LIST_OF_SSD="$DEVICE($PRINT_NAME), $LIST_OF_SSD"
+                fi
+            fi
+
+            DISK_INDEX=$(( $DISK_INDEX + 1 ))
+        fi
+    done < /proc/partitions
+
+    if [[ -z $LIST_OF_SSD ]]; then
+        LIST_OF_SSD="none"
+    fi
+    if [[ -z $LIST_OF_HDD ]]; then
+        LIST_OF_HDD="none"
+    fi
+}
+
+function init_output_file {
+    # Delete the csv file before starting dstat, since dstat appends to any
+    # existing file instead of always creating a new file
+    rm -f "$DEST"
+}
+
+
+# Writes to the $DEST file
+function write_configuration_info {
+    set -e
+    echo "/*** CONFIGURATION INFORMATION ***/" >> "$DEST"
+    echo "\"Linux dstat\"" >> "$DEST"
+
+    # Get the number of network interfaces by checking the size of one of the arrays.
+    max_net=${#NET_SPEED[@]}
+
+    # The network speed is given in megabits/sec
+    # Since the data given us by dstat is in bytes, multiply by 1,000,000 and
+    # then divide by 8. Then divide by 100 to get percent.
+
+    # Have a default network information entry for now, since the server code expects it.
+    # Note this may seem clunky, but it is basically what the code always did before, stopping after reading
+    # the first good value. This code will be removed soon.
+    i=0
+    while [[ $i -lt $max_net ]]; do
+        if [[ ${NET_SPEED[$i]} -gt 0 ]]; then
+            NET_BANDWIDTH=$(( (${NET_SPEED[$i]} * 1000 * 1000 / 8) / 100 ))
+            echo "\"netSpeed = ${NET_SPEED[$i]}\"" >> "$DEST"
+            echo "\"netBandwidth = $NET_BANDWIDTH\"" >> "$DEST"
+            echo "\"netFullDuplex = $(echo "${NET_DUPLEX[$i]}" | tr '[:upper:]' '[:lower:]')\"" >> "$DEST"
+            break
+        fi
+        let "i++"
+    done
+
+    # Write the network information for each separate interface.
+    i=0
+    while [[ $i -lt $max_net ]]; do
+        NET_BANDWIDTH=$(( (${NET_SPEED[$i]} * 1000 * 1000 / 8) / 100 ))
+        echo "\"netSpeed.${NET_DEVICES[$i]} = ${NET_SPEED[$i]}\"" >> "$DEST"
+        echo "\"netBandwidth.${NET_DEVICES[$i]} = $NET_BANDWIDTH\"" >> "$DEST"
+        echo "\"netFullDuplex.${NET_DEVICES[$i]} = $(echo "${NET_DUPLEX[$i]}" | tr '[:upper:]' '[:lower:]')\"" >> "$DEST"
+        let "i++"
+    done
+
+    # Write the OS and CPU information
+    echo "\"os_name = $OS_NAME\"" >> "$DEST"
+    echo "\"cpu_model = $CPU_MODEL\"" >> "$DEST"
+    echo "\"cpu_cores = $CPU_CORES\"" >> "$DEST"
+    echo "\"cpu_sockets = $CPU_SOCKETS\"" >> "$DEST"
+    echo "\"cpu_cores_per_socket = $CPU_CORES_PER_SOCKET\"" >> "$DEST"
+    echo "\"cpu_threads_per_core = $CPU_THREADS_PER_CORE\"" >> "$DEST"
+
+    # Write the memory information
+    echo "\"memory_size = $MEMORY_SIZE_IN_KB\"" >> "$DEST"
+    echo "\"swap_size = $SWAP_SIZE_IN_KB\"" >> "$DEST"
+
+    # Timezone information
+    echo "\"timezoneOffset = $( date +%:z )\"" >> "$DEST"
+    echo "\"timezoneAbbrev = $( date +%Z )\"" >> "$DEST"
+
+    # Disk information from gather_disk_info
+    echo "\"list_of_ssd = $LIST_OF_SSD\""    >> "$DEST"
+    echo "\"list_of_hdd = $LIST_OF_HDD\""    >> "$DEST"
+    echo "\"pagesize = `getconf PAGESIZE`\"" >> "$DEST"
+
+    # mapping  of logical volumes to physical volume
+    # reverse map the logical device to the associated physical device using lsblk
+    LOG_DEV=()
+    phy_dev_final=()
+    single_device=()
+
+    if [[ -f /proc/mdstat ]]; then
+        no_of_lines=$( cat /proc/mdstat | grep "md" | wc -l)
+        for l in `seq 1 $no_of_lines`; do
+            raid[l]=$(cat /proc/mdstat | grep "md" | sed -n "${l}p" | tr ":" "\n" | sed 's/\<active\>//')
+            raid1[l]=$(echo ${raid[l]} | cut -d ' ' -f2 --complement )
+            md_device=$(echo ${raid1[l]} | awk '{print $1}')
+            LOG_DEV[l]=$(echo ${raid1[l]} | cut -d ' ' -f1 --complement | sed -e 's/\[[^][]*\]//g')
+            for k in $seq 0 1 ; do
+                single_device=(${LOG_DEV[l]})
+                phy_dev[k]=$(lsblk | grep -B 1 ${single_device[k]} | grep "disk" | awk '{print $1}')
+            done
+            if [[ -z $LIST_OF_MD ]]; then
+                LIST_OF_MD="$md_device(${phy_dev[@]})"
+            else
+                LIST_OF_MD="$md_device(${phy_dev[@]}), $LIST_OF_MD"
+            fi
+        done
+        echo "\"list_of_md = $LIST_OF_MD\"" >> "$DEST"
+    fi
+
+    echo "\"list_of_rdma = ${RDMA_DEVICES[@]}\"" >> "$DEST"
+    # Version that (hopefully) will allow us to change the data and verify that
+    # the Javascript understands what it's seeing
+    echo "\"dataVersion = $COLLECTOR_DATA_VERSION\"" >> "$DEST"
+    set +e
+}
+
+
+function pid_is_running {
+    local pid=$1
+    local count=$(ps -A| grep $pid |wc -l)
+    test $count -gt 0
+}
+
+
+# Gather dstat information we need for analysis
+#
+# dstat options used:
+#
+# --nocolor knocks out the escape sequences to color the data
+#
+# --noheaders knocks out the periodic repetition of the headers, as well as
+#   updates every second for intermediate values
+#
+# --epoch - displays the time for each sample as seconds since 1-Jan-1970
+#
+# --cpu - displays CPU stats for the total system (all CPUs). The data
+#   includes system (kernel) time, idle time, io wait time, and time spent
+#   servicing hard and soft interrupts
+#
+# --net - displays bytes sent and received
+#
+# -N <netdevicelist> - displays stats for each network device separately
+#
+# -dD <disklist> - displays disk stats for the specified disks
+#
+# --io - displays I/O requests completed
+#
+# --disk-queue - displays the instantaneous queue depth at the moment of collection
+#
+# --disk-time - displays the amount of time spent in disk accesses for the last epoch
+#
+# --output file - writes CSV output to file
+#
+# By default dstat samples the information once per second
+function start_dstat_collection {
+    rm -f $DSTAT_TMP_DEST
+    dstat --nocolor --noheaders --epoch --cpu --net -N $NET_DEVICES_CSV -dD $LIST_OF_DISKS $DSTAT_QUEUE $DSTAT_TIME --io --mem --page --vm $DSTAT_RDMA --output $DSTAT_TMP_DEST > /dev/null &
+    echo $!  # The PID of the launched process
+}
+
+function try_to_start_pmwatch_collection {
+    which ipmwatch > $LOGFILE 2>&1
+    if [[ $? -eq 0 ]] ; then
+        ipmwatch --avail > $LOGFILE 2>&1
+        if [[ $? -eq 0 ]] ; then
+            ipmwatch 1 -f $NVDIMM_TMP_DEST &
+        else
+            echo ""
+            echo "WARNING: Intel Persistent Memory devices could not be detected by $PERSISTENT_MEMORY_METRICS_COLLECTOR."
+            echo "For more details, see $LOGFILE"
+            echo ""
+        fi
+    else
+        $COLLECTOR_SCRIPTS_DIR/nvdimm_check.sh
+        if [[ $? -eq 0 ]]; then
+            echo ""
+            echo "WARNING: $PERSISTENT_MEMORY_METRICS_COLLECTOR was not found. Persistent Memory metrics will not be collected."
+            echo "For more details, see $LOGFILE"
+            echo ""
+        fi
+    fi
+}
+
+function start_emon_collection {
+    rm -f $EMON_TMP_DEST
+    emon -V -t0.05 -l1000000 -f $EMON_TMP_DEST -preset $preset > /dev/null &
+    echo $!  # The PID of the launched process
+}
+
+function start_collection {
+    try_to_start_pmwatch_collection
+    dstat_pid=$(start_dstat_collection)
+    emon_pid=$(start_emon_collection)
+    sleep 2
+    if pid_is_running $dstat_pid && pid_is_running $emon_pid ; then
+        echo "Gathering Platform Profiler collection data. Run vpp-collect stop to finish the collection."
+    else
+        # At this point, either dstat, or emon, or both failed to launch. So let's make sure we don't leave "half a collection" running.
+        kill -9 $dstat_pid > /dev/null 2>&1
+        kill -9 $emon_pid > /dev/null 2>&1
+        echo "Collection aborted."
+    fi
+}
+
+function show_persistent_memory_warning {
+    vpp_collect_dir=$( dirname ${BASH_SOURCE[0]} )/..
+    if [[ $(whoami) != "root" && -d $vpp_collect_dir/ipmwatch ]]; then
+        local msg="User needs sudo privilege to collect Persistent Memory metrics. Persistent Memory metrics will not be collected."
+        echo "$msg"
+    fi
+}
+
+function check_preconditions {
+    ensure_lspci_is_installed &&
+    ensure_dstat_is_installed &&
+    ensure_dstat_plugins_are_installed &&
+    ensure_sep_driver_is_loaded &&
+    ensure_emon_is_accessible &&
+    ensure_selected_emon_preset_is_supported &&
+    ensure_machine_is_supported_for_preset $preset &&
+    ensure_no_collection_is_running &&
+    show_persistent_memory_warning
+}
+
+function gather_configuration_info {
+    gather_network_device_info
+    gather_cpu_info
+    gather_memory_info
+    gather_disk_info
+}
+
+get_os_details
+parse_command_options "$@"
+
+create_temp_directory &&
+prepare_result_location &&
+set_globals &&
+init_logfile &&
+
+check_preconditions &&
+create_result_location &&
+
+init_output_file &&
+gather_configuration_info &&
+write_configuration_info &&
+start_collection
